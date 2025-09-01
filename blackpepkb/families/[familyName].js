@@ -1,8 +1,14 @@
 import React, { useEffect, useState } from "react";
+import PropTypes from "prop-types";
 import Head from "next/head";
 import { useRouter } from "next/router";
-import Link from "next/link";
-import { FaDna, FaSearch, FaTimes, FaBars } from "react-icons/fa";
+import {
+  FaDna,
+  FaSearch,
+  FaTimes,
+  FaDownload,
+  FaSpinner,
+} from "react-icons/fa";
 import styles from "../../styles/genes.module.css";
 import geneStructureStyles from "../../styles/genes_structure.module.css";
 import Footer from "../../components/footer";
@@ -148,6 +154,13 @@ const GeneStructurePopup = ({ geneId, geneData, onClose }) => {
   );
 };
 
+// Add PropTypes validation
+GeneStructurePopup.propTypes = {
+  geneId: PropTypes.string,
+  geneData: PropTypes.array.isRequired,
+  onClose: PropTypes.func.isRequired,
+};
+
 // Main Family Page Component
 const FamilyPage = () => {
   const [data, setData] = useState([]);
@@ -155,9 +168,9 @@ const FamilyPage = () => {
   const [searchTerm, setSearchTerm] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [isMenuOpen, setIsMenuOpen] = useState(false);
-  const [openDropdown, setOpenDropdown] = useState(null);
   const [selectedGeneId, setSelectedGeneId] = useState(null); // For popup functionality
+  const [downloadingGene, setDownloadingGene] = useState(null); // Track which gene is being downloaded
+  const [downloadingType, setDownloadingType] = useState(null); // Track download type
   const router = useRouter();
   const { familyName } = router.query;
 
@@ -230,18 +243,6 @@ const FamilyPage = () => {
     setFilteredData(data);
   };
 
-  const toggleMenu = () => {
-    setIsMenuOpen(!isMenuOpen);
-  };
-
-  const toggleDropdown = (index) => {
-    if (openDropdown === index) {
-      setOpenDropdown(null);
-    } else {
-      setOpenDropdown(index);
-    }
-  };
-
   // Handler to open the structure popup when a gene ID is clicked
   const handleGeneClick = (e, geneId) => {
     e.preventDefault(); // Prevent default link navigation
@@ -251,6 +252,58 @@ const FamilyPage = () => {
   // Handler to close the popup
   const handleClosePopup = () => {
     setSelectedGeneId(null);
+  };
+
+  // Handler for individual gene sequence downloads
+  const handleGeneDownload = async (geneId, sequenceType, e) => {
+    e.stopPropagation(); // Prevent row click events
+
+    setDownloadingGene(geneId);
+    setDownloadingType(sequenceType);
+
+    try {
+      const response = await fetch(
+        `/api/download-gene-sequence?geneId=${encodeURIComponent(
+          geneId
+        )}&type=${sequenceType}`
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(
+          errorData.error ||
+            `Failed to download ${sequenceType} sequence for ${geneId}`
+        );
+      }
+
+      // Get the filename from the response headers or create a default one
+      const contentDisposition = response.headers.get("Content-Disposition");
+      let filename = `${geneId}_${sequenceType}.fasta`;
+
+      if (contentDisposition) {
+        const filenameMatch = contentDisposition.match(/filename="?(.+)"?/);
+        if (filenameMatch) {
+          filename = filenameMatch[1];
+        }
+      }
+
+      // Create and trigger download
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Download error:", error);
+      alert(`Error downloading ${sequenceType} sequence: ${error.message}`);
+    } finally {
+      setDownloadingGene(null);
+      setDownloadingType(null);
+    }
   };
 
   return (
@@ -343,6 +396,7 @@ const FamilyPage = () => {
                         <th>Gene ID</th>
                         <th>Chromosome</th>
                         <th>Location</th>
+                        <th>Download Sequences</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -359,6 +413,48 @@ const FamilyPage = () => {
                           </td>
                           <td>{gene.Chromosome}</td>
                           <td>{gene.GeneRange}</td>
+                          <td>
+                            <div className={styles.downloadButtonsContainer}>
+                              <button
+                                className={styles.downloadButton}
+                                onClick={(e) =>
+                                  handleGeneDownload(gene.GeneID, "cds", e)
+                                }
+                                disabled={
+                                  downloadingGene === gene.GeneID &&
+                                  downloadingType === "cds"
+                                }
+                                title="Download CDS sequence"
+                              >
+                                {downloadingGene === gene.GeneID &&
+                                downloadingType === "cds" ? (
+                                  <FaSpinner className={styles.spinning} />
+                                ) : (
+                                  <FaDownload />
+                                )}
+                                CDS
+                              </button>
+                              <button
+                                className={styles.downloadButton}
+                                onClick={(e) =>
+                                  handleGeneDownload(gene.GeneID, "protein", e)
+                                }
+                                disabled={
+                                  downloadingGene === gene.GeneID &&
+                                  downloadingType === "protein"
+                                }
+                                title="Download Protein sequence"
+                              >
+                                {downloadingGene === gene.GeneID &&
+                                downloadingType === "protein" ? (
+                                  <FaSpinner className={styles.spinning} />
+                                ) : (
+                                  <FaDownload />
+                                )}
+                                Protein
+                              </button>
+                            </div>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -366,7 +462,7 @@ const FamilyPage = () => {
                 </div>
               ) : (
                 <div className={styles.noResults}>
-                  <p>No genes found matching "{searchTerm}"</p>
+                  <p>No genes found matching &quot;{searchTerm}&quot;</p>
                   <button
                     className={styles.resetSearchButton}
                     onClick={handleResetSearch}
