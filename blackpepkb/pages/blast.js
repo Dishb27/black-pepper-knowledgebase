@@ -1,3 +1,4 @@
+// pages/blast.js - Complete implementation with AWS backend integration
 import Head from "next/head";
 import React, { useState, useEffect } from "react";
 import {
@@ -10,9 +11,12 @@ import styles from "../styles/blast.module.css";
 import { useRouter } from "next/router";
 import Header from "../components/header";
 import Footer from "../components/footer";
+import { runBlast, getDatabases } from "../../lib/blast-api";
 
+// Import the API functions from our centralized module
 const Blast = () => {
   const router = useRouter();
+
   const [formData, setFormData] = useState({
     sequence: "",
     program: "blastn",
@@ -22,7 +26,6 @@ const Blast = () => {
     eValue: "1e-2",
   });
   const [file, setFile] = useState(null);
-  const [fileContent, setFileContent] = useState(null);
   const [advancedOptions, setAdvancedOptions] = useState(false);
   const [notification, setNotification] = useState({ message: "", type: "" });
   const [isLoading, setIsLoading] = useState(false);
@@ -30,6 +33,14 @@ const Blast = () => {
   const [errors, setErrors] = useState({});
   const [fileUploaded, setFileUploaded] = useState(false);
   const [sequenceType, setSequenceType] = useState(null);
+  const [databases, setDatabases] = useState({});
+  const [backendStatus, setBackendStatus] = useState("checking");
+
+  // Check backend status and load databases on component mount
+  useEffect(() => {
+    checkBackendStatus();
+    loadDatabases();
+  }, []);
 
   // Clear notification after 5 seconds
   useEffect(() => {
@@ -41,19 +52,58 @@ const Blast = () => {
     }
   }, [notification]);
 
-  // Effect to validate sequence type when program changes
+  // Validate sequence type when program changes
   useEffect(() => {
     if (sequenceType && formData.program) {
       validateSequenceTypeWithProgram(formData.program, sequenceType);
     }
   }, [formData.program, sequenceType]);
 
-  // Effect to validate database compatibility when program or database changes
+  // Validate database compatibility
   useEffect(() => {
     if (formData.program && formData.database) {
       validateProgramDatabaseCompatibility(formData.program, formData.database);
     }
   }, [formData.program, formData.database]);
+
+  // Helper function to count sequences in FASTA content
+  const countSequencesInFasta = (content) => {
+    if (!content || typeof content !== "string") return 0;
+
+    // Count lines that start with ">" (FASTA headers)
+    const sequenceCount = (content.match(/^>/gm) || []).length;
+    return sequenceCount;
+  };
+
+  // Check backend status
+  const checkBackendStatus = async () => {
+    try {
+      // Test the connection by fetching databases
+      await getDatabases("/api/databases");
+      setBackendStatus("online");
+    } catch (error) {
+      console.error("Backend connection error:", error);
+      setBackendStatus("offline");
+      setNotification({
+        message: "Unable to connect to BLAST server",
+        type: "error",
+      });
+    }
+  };
+
+  // Load available databases
+  const loadDatabases = async () => {
+    try {
+      const data = await getDatabases();
+      setDatabases(data.databases || {});
+    } catch (error) {
+      console.error("Error loading databases:", error);
+      setNotification({
+        message: "Failed to load databases. Please try again later.",
+        type: "error",
+      });
+    }
+  };
 
   const toggleAdvancedOptions = () => {
     setAdvancedOptions(!advancedOptions);
@@ -63,17 +113,13 @@ const Blast = () => {
     const { name, value } = e.target;
     setFormData({ ...formData, [name]: value });
 
-    // Clear related error when user makes changes
     if (errors[name]) {
       setErrors({ ...errors, [name]: "" });
     }
 
-    // Check sequence type when user inputs a sequence
     if (name === "sequence" && value) {
       const detected = determineSequenceType(value);
       setSequenceType(detected);
-
-      // If program is already selected, validate compatibility
       if (formData.program) {
         validateSequenceTypeWithProgram(formData.program, detected);
       }
@@ -83,57 +129,55 @@ const Blast = () => {
     }
   };
 
-  const handleFileUpload = (e) => {
+  const handleFileUpload = async (e) => {
     const selectedFile = e.target.files[0];
     if (!selectedFile) {
-      setFile(null);
-      setFileContent(null);
-      setFileUploaded(false);
-      setSequenceType(null);
-      setErrors({ ...errors, sequence: "" });
+      resetFileState();
       return;
     }
 
-    // Validate file type
-    const validFileTypes = [".fasta", ".fa", ".fna"];
-    const fileExtension = selectedFile.name
+    // Validate file type and size
+    const validExtensions = [".fasta", ".fa", ".fas", ".txt"];
+    const fileExt = selectedFile.name
       .substring(selectedFile.name.lastIndexOf("."))
       .toLowerCase();
+    const maxSize = 10.1 * 1024 * 1024; // 10MB
 
-    if (!validFileTypes.includes(fileExtension)) {
-      setFileError(
-        "Invalid file type. Please upload a FASTA file (.fasta, .fa, .fna)"
-      );
-      setFile(null);
-      setFileContent(null);
-      setFileUploaded(false);
+    if (!validExtensions.includes(fileExt)) {
+      setFileError("Invalid file type. Please upload a FASTA file.");
+      resetFileState();
       return;
     }
 
-    // File size validation (max 2MB)
-    const maxSize = 2 * 1024 * 1024; // 2MB
     if (selectedFile.size > maxSize) {
-      setFileError("File is too large. Maximum size is 2MB.");
-      setFile(null);
-      setFileContent(null);
-      setFileUploaded(false);
+      setFileError("File is too large. Maximum size is 10MB.");
+      resetFileState();
       return;
     }
 
-    // Read file content and convert to base64
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const fileContent = event.target.result;
-      // Get the base64 part of the data URL
-      const base64Content = fileContent.split(",")[1];
-      setFileContent(base64Content);
+    try {
+      const textContent = await readFileContent(selectedFile);
 
-      // Check the file content to determine if it's protein or nucleotide
-      const textContent = atob(base64Content);
+      // Check sequence count
+      const sequenceCount = countSequencesInFasta(textContent);
+
+      if (sequenceCount === 0) {
+        setFileError("No valid FASTA sequences found in the file.");
+        resetFileState();
+        return;
+      }
+
+      if (sequenceCount > 5) {
+        setFileError(
+          `File contains ${sequenceCount} sequences. Maximum 5 sequences allowed.`
+        );
+        resetFileState();
+        return;
+      }
+
       const detected = determineSequenceType(textContent);
       setSequenceType(detected);
 
-      // If program is already selected, validate compatibility
       if (formData.program) {
         validateSequenceTypeWithProgram(formData.program, detected);
       }
@@ -141,29 +185,32 @@ const Blast = () => {
       setFileError("");
       setFile(selectedFile);
       setFileUploaded(true);
-
-      // Clear sequence input if there was any
-      if (formData.sequence) {
-        setFormData({ ...formData, sequence: "" });
-      }
-    };
-
-    reader.onerror = () => {
+      setFormData({ ...formData, sequence: "" });
+    } catch {
       setFileError("Failed to read file. Please try again.");
-      setFile(null);
-      setFileContent(null);
-      setFileUploaded(false);
-    };
-
-    // Read as data URL to get base64 encoding
-    reader.readAsDataURL(selectedFile);
+      resetFileState();
+    }
   };
 
-  // Helper function to determine if sequence is protein or nucleotide
+  const readFileContent = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (event) => resolve(event.target.result);
+      reader.onerror = () => reject(new Error("File read error"));
+      reader.readAsText(file);
+    });
+  };
+
+  const resetFileState = () => {
+    setFile(null);
+    setFileUploaded(false);
+    setSequenceType(null);
+    setErrors({ ...errors, sequence: "" });
+  };
+
   const determineSequenceType = (sequence) => {
     if (!sequence) return null;
 
-    // Remove FASTA header lines and whitespace
     const cleanedSequence = sequence
       .split("\n")
       .filter((line) => !line.startsWith(">"))
@@ -173,71 +220,53 @@ const Blast = () => {
 
     if (cleanedSequence.length === 0) return null;
 
-    // Count non-nucleotide characters (not A, T, G, C, N)
     const nonNucleotideChars = cleanedSequence.replace(/[ATGCN]/g, "");
-
-    // If more than 10% of characters are non-nucleotide, likely a protein sequence
     return nonNucleotideChars.length / cleanedSequence.length > 0.1
       ? "protein"
       : "nucleotide";
   };
 
-  // Validate sequence type with program
   const validateSequenceTypeWithProgram = (program, type) => {
     if (!type || !program) return true;
 
-    if (program === "blastn" && type === "protein") {
-      setErrors({
-        ...errors,
-        sequence:
-          "Protein sequences cannot be used with blastn. Please use blastp for protein sequences or provide a nucleotide sequence.",
-      });
+    const mismatches = {
+      blastn:
+        "Protein sequences cannot be used with blastn. Use blastp or provide nucleotide sequence.",
+      blastp:
+        "Nucleotide sequences cannot be used with blastp. Use blastn or provide protein sequence.",
+    };
+
+    if (
+      (program === "blastn" && type === "protein") ||
+      (program === "blastp" && type === "nucleotide")
+    ) {
+      setErrors({ ...errors, sequence: mismatches[program] });
       return false;
     }
 
-    if (program === "blastp" && type === "nucleotide") {
-      setErrors({
-        ...errors,
-        sequence:
-          "Nucleotide sequences cannot be used with blastp. Please use blastn for nucleotide sequences or provide a protein sequence.",
-      });
-      return false;
-    }
-
-    // Clear error if types match
     setErrors({ ...errors, sequence: "" });
     return true;
   };
 
-  // Validate program and database compatibility
   const validateProgramDatabaseCompatibility = (program, database) => {
-    if (!program || !database) return true;
+    if (!program || !database || !databases[database]) return true;
 
-    // For blastn, protein databases are incompatible
-    if (program === "blastn" && database === "Piper_nigrum_prot_db") {
-      setErrors({
-        ...errors,
-        database:
-          "blastn cannot be used with protein databases. Please select a nucleotide database or switch to blastp.",
-      });
-      return false;
-    }
+    const dbInfo = databases[database];
+    const mismatches = {
+      blastn:
+        "blastn cannot be used with protein databases. Select a nucleotide database or switch to blastp.",
+      blastp:
+        "blastp cannot be used with nucleotide databases. Select a protein database or switch to blastn.",
+    };
 
-    // For blastp, nucleotide databases are incompatible
     if (
-      program === "blastp" &&
-      (database === "Piper_nigrum_genome_db" ||
-        database === "Piper_nigrum_cds_db")
+      (program === "blastn" && dbInfo.type === "protein") ||
+      (program === "blastp" && dbInfo.type === "nucleotide")
     ) {
-      setErrors({
-        ...errors,
-        database:
-          "blastp cannot be used with nucleotide databases. Please select a protein database or switch to blastn.",
-      });
+      setErrors({ ...errors, database: mismatches[program] });
       return false;
     }
 
-    // Clear error if compatible
     setErrors({ ...errors, database: "" });
     return true;
   };
@@ -245,40 +274,43 @@ const Blast = () => {
   const validateForm = () => {
     const newErrors = {};
 
-    // Validate database selection
+    if (backendStatus !== "online") {
+      newErrors.general =
+        "BLAST server is not available. Please try again later.";
+    }
+
     if (!formData.database) {
       newErrors.database = "Please select a database";
     }
 
-    // Validate sequence input or file upload
     if (!formData.sequence && !file) {
       newErrors.sequence = "Please enter a sequence or upload a file";
     }
 
-    // Validate sequence count if sequence is provided
+    // Check sequence count for manual input
     if (formData.sequence) {
-      const sequenceCount = formData.sequence.split(">").length - 1;
+      const sequenceCount = countSequencesInFasta(formData.sequence);
       if (sequenceCount > 5) {
-        newErrors.sequence = "You can only submit a maximum of 5 sequences";
+        newErrors.sequence = "Maximum 5 sequences allowed";
+      }
+      if (sequenceCount === 0) {
+        newErrors.sequence = "No valid FASTA sequences found";
       }
     }
 
-    // Validate e-value format
     const eValuePattern = /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/;
     if (!eValuePattern.test(formData.eValue)) {
-      newErrors.eValue = "Please enter a valid e-value (e.g., 1e-2)";
+      newErrors.eValue = "Invalid e-value format (e.g., 1e-2)";
     }
 
-    // Validate numerical inputs
     if (formData.numDescriptions <= 0) {
-      newErrors.numDescriptions = "Value must be greater than 0";
+      newErrors.numDescriptions = "Must be greater than 0";
     }
 
     if (formData.numAlignments <= 0) {
-      newErrors.numAlignments = "Value must be greater than 0";
+      newErrors.numAlignments = "Must be greater than 0";
     }
 
-    // Check sequence type compatibility with program
     if (sequenceType) {
       const isCompatible = validateSequenceTypeWithProgram(
         formData.program,
@@ -289,7 +321,6 @@ const Blast = () => {
       }
     }
 
-    // Check program-database compatibility
     if (formData.program && formData.database) {
       const isCompatible = validateProgramDatabaseCompatibility(
         formData.program,
@@ -318,53 +349,33 @@ const Blast = () => {
     try {
       setIsLoading(true);
 
-      // Prepare form data
-      const blastData = {
-        sequence: formData.sequence,
+      let sequence = formData.sequence;
+      if (file) {
+        sequence = await readFileContent(file);
+      }
+
+      // Use the centralized API function
+      const result = await runBlast({
         program: formData.program,
         database: formData.database,
-        numDescriptions: parseInt(formData.numDescriptions),
-        numAlignments: parseInt(formData.numAlignments),
+        sequence,
+        numDescriptions: formData.numDescriptions,
+        numAlignments: formData.numAlignments,
         eValue: formData.eValue,
-      };
-
-      // Add file data in the format expected by the API if a file is uploaded
-      if (file && fileContent) {
-        blastData.file = {
-          name: file.name,
-          content: fileContent, // Base64 encoded content
-        };
-      }
-
-      // Send request to the API
-      const response = await fetch("/api/blast", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(blastData),
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to submit BLAST query");
-      }
-
-      // Redirect to results page
       router.push({
         pathname: "/resultblast",
         query: {
-          results: JSON.stringify(data.results),
+          results: JSON.stringify(result.results),
           program: formData.program,
           database: formData.database,
         },
       });
     } catch (error) {
-      console.error("Error submitting BLAST query:", error);
+      console.error("BLAST error:", error);
       setNotification({
-        message:
-          error.message || "An error occurred while processing your request",
+        message: error.message || "An error occurred",
         type: "error",
       });
     } finally {
@@ -382,37 +393,57 @@ const Blast = () => {
       eValue: "1e-2",
     });
     setFile(null);
-    setFileContent(null);
     setFileUploaded(false);
     setErrors({});
     setFileError("");
     setSequenceType(null);
   };
 
-  // Helper function to get database options based on selected program
   const getDatabaseOptions = () => {
-    if (formData.program === "blastn") {
-      return (
-        <>
-          <option value="">- Choose a database -</option>
-          <option value="Piper_nigrum_genome_db">
-            Piper nigrum genome database
+    const options = [
+      <option key="default" value="">
+        - Choose a database -
+      </option>,
+    ];
+
+    Object.entries(databases).forEach(([dbName, dbInfo]) => {
+      if (
+        (formData.program === "blastn" && dbInfo.type === "nucleotide") ||
+        (formData.program === "blastp" && dbInfo.type === "protein")
+      ) {
+        options.push(
+          <option key={dbName} value={dbName}>
+            {dbInfo.description}
           </option>
-          <option value="Piper_nigrum_cds_db">Piper nigrum CDS database</option>
-        </>
-      );
-    } else if (formData.program === "blastp") {
-      return (
-        <>
-          <option value="">- Choose a database -</option>
-          <option value="Piper_nigrum_prot_db">
-            Piper nigrum protein database
-          </option>
-        </>
-      );
-    } else {
-      return <option value="">- Choose a database -</option>;
-    }
+        );
+      }
+    });
+
+    return options;
+  };
+
+  const BackendStatusIndicator = () => {
+    const statusConfig = {
+      checking: {
+        text: "Checking BLAST server...",
+        icon: <FaSpinner className={styles.spinner} />,
+        className: styles.checking,
+      },
+      online: { text: "✅ BLAST server is online", className: styles.online },
+      offline: {
+        text: "⚠️ BLAST server is offline",
+        className: styles.offline,
+      },
+    };
+
+    const status = statusConfig[backendStatus] || statusConfig.offline;
+
+    return (
+      <div className={`${styles.statusIndicator} ${status.className}`}>
+        {status.icon}
+        <span>{status.text}</span>
+      </div>
+    );
   };
 
   return (
@@ -432,11 +463,19 @@ const Blast = () => {
         <div className={styles.blastContainer}>
           <h1 className={styles.blastTitle}>BLAST Search</h1>
 
+          <BackendStatusIndicator />
+
           {notification.message && (
             <div
               className={`${styles.notification} ${styles[notification.type]}`}
             >
               {notification.message}
+            </div>
+          )}
+
+          {errors.general && (
+            <div className={`${styles.notification} ${styles.error}`}>
+              {errors.general}
             </div>
           )}
 
@@ -446,14 +485,13 @@ const Blast = () => {
               <h3 className={styles.legend}>Select BLAST Program</h3>
               <div className={styles.formGroup}>
                 <select
-                  id="program"
                   name="program"
                   value={formData.program}
                   onChange={handleInputChange}
                   className={styles.select}
                 >
-                  <option value="blastn">blastn</option>
-                  <option value="blastp">blastp</option>
+                  <option value="blastn">blastn (nucleotide-nucleotide)</option>
+                  <option value="blastp">blastp (protein-protein)</option>
                 </select>
               </div>
             </div>
@@ -463,7 +501,6 @@ const Blast = () => {
               <h3 className={styles.legend}>Choose a Search Set</h3>
               <div className={styles.formGroup}>
                 <select
-                  id="database"
                   name="database"
                   value={formData.database}
                   onChange={handleInputChange}
@@ -484,20 +521,20 @@ const Blast = () => {
               <h3 className={styles.legend}>Enter Query Sequence(s)</h3>
               <div className={styles.formGroup}>
                 <textarea
-                  id="sequence"
                   name="sequence"
                   value={formData.sequence}
                   onChange={handleInputChange}
-                  placeholder={`Enter one or more queries (1 to 5 sequences) in FASTA format`}
+                  placeholder="Enter 1-5 sequences in FASTA format"
                   className={`${styles.textarea} ${
                     errors.sequence ? styles.inputError : ""
                   }`}
+                  disabled={file !== null}
+                  rows={8}
                 />
                 {errors.sequence && (
                   <p className={styles.errorText}>{errors.sequence}</p>
                 )}
 
-                {/* Sequence type indicator */}
                 {formData.sequence && sequenceType && (
                   <div
                     className={`${styles.sequenceTypeIndicator} ${
@@ -516,16 +553,16 @@ const Blast = () => {
 
                 <div className={styles.fileUploadSection}>
                   <p className={styles.fileInstructions}>
-                    Or upload a FASTA file (.fasta, .fa, .fna) containing your
-                    sequence(s):
+                    Or upload a FASTA file (.fasta, .fa, .fas, .txt):
                   </p>
 
                   <label className={styles.fileInputLabel}>
                     <input
                       type="file"
                       onChange={handleFileUpload}
-                      accept=".fasta,.fa,.fna"
+                      accept=".fasta,.fa,.fas,.txt"
                       className={styles.fileInput}
+                      disabled={formData.sequence !== ""}
                     />
                     <span className={styles.customFileButton}>
                       <FaUpload />{" "}
@@ -538,7 +575,6 @@ const Blast = () => {
 
                   {fileError && <p className={styles.errorText}>{fileError}</p>}
 
-                  {/* File sequence type indicator */}
                   {file && sequenceType && (
                     <div
                       className={`${styles.sequenceTypeIndicator} ${
@@ -555,7 +591,9 @@ const Blast = () => {
                     </div>
                   )}
 
-                  <p className={styles.fileNotice}>Maximum file size: 2MB</p>
+                  <p className={styles.fileNotice}>
+                    Max 10MB • Max 5 sequences
+                  </p>
                 </div>
               </div>
             </div>
@@ -576,15 +614,11 @@ const Blast = () => {
                 <div className={styles.advancedOptionsContent}>
                   <div className={styles.advancedOptionsGrid}>
                     <div className={styles.formGroup}>
-                      <label
-                        htmlFor="numDescriptions"
-                        className={styles.formLabel}
-                      >
+                      <label className={styles.formLabel}>
                         Number of Descriptions
                       </label>
                       <input
                         type="number"
-                        id="numDescriptions"
                         name="numDescriptions"
                         value={formData.numDescriptions}
                         onChange={handleInputChange}
@@ -592,6 +626,7 @@ const Blast = () => {
                           errors.numDescriptions ? styles.inputError : ""
                         }`}
                         min="1"
+                        max="100"
                       />
                       {errors.numDescriptions && (
                         <p className={styles.errorText}>
@@ -601,15 +636,11 @@ const Blast = () => {
                     </div>
 
                     <div className={styles.formGroup}>
-                      <label
-                        htmlFor="numAlignments"
-                        className={styles.formLabel}
-                      >
+                      <label className={styles.formLabel}>
                         Number of Alignments
                       </label>
                       <input
                         type="number"
-                        id="numAlignments"
                         name="numAlignments"
                         value={formData.numAlignments}
                         onChange={handleInputChange}
@@ -617,6 +648,7 @@ const Blast = () => {
                           errors.numAlignments ? styles.inputError : ""
                         }`}
                         min="1"
+                        max="100"
                       />
                       {errors.numAlignments && (
                         <p className={styles.errorText}>
@@ -626,12 +658,11 @@ const Blast = () => {
                     </div>
 
                     <div className={styles.formGroup}>
-                      <label htmlFor="eValue" className={styles.formLabel}>
-                        E-value (Expected Threshold)
+                      <label className={styles.formLabel}>
+                        E-value Threshold
                       </label>
                       <input
                         type="text"
-                        id="eValue"
                         name="eValue"
                         value={formData.eValue}
                         onChange={handleInputChange}
@@ -661,7 +692,7 @@ const Blast = () => {
               <button
                 type="submit"
                 className={styles.submitButton}
-                disabled={isLoading}
+                disabled={isLoading || backendStatus !== "online"}
               >
                 {isLoading ? (
                   <>
